@@ -1,0 +1,16 @@
+[package]
+name = "zz"
+version = "0.1.0"
+edition = "2024"
+authors = ["Eneko Sarasola"]
+description = "Run commands in directories via zoxide, with optional git worktree jumping."
+license = "MIT"
+repository = "https://github.com/enekos/zz"
+keywords = ["zoxide", "cd", "cli", "productivity", "worktree"]
+categories = ["command-line-utilities"]
+rust-version = "1.85"
+
+[dependencies]
+dotenvy = "0.15.7"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
