@@ -13,13 +13,17 @@ struct TopRow {
 fn print_usage() {
     eprintln!("zz - Run commands in directories via zoxide");
     eprintln!(
-        "Usage: zz [-r|--root] [-w|--worktree <branch>] [-V|--version] <query>[@branch] [command...]"
+        "Usage: zz [-r|--root] [-w|--worktree <branch>] [-s|--search <term>] [--success-only] [-V|--version] <query>[@branch] [command...]"
     );
     eprintln!("\nOptions:");
     eprintln!(
         "  -r, --root              Execute command at the git root of the resolved directory"
     );
     eprintln!("  -w, --worktree <branch> Use a specific git worktree for the resolved repository");
+    eprintln!(
+        "  -s, --search <term>     Pre-filter aztarna suggestions by command text (interactive mode)"
+    );
+    eprintln!("  --success-only          Only show aztarna commands that exited successfully");
     eprintln!("  -V, --version           Print version");
     eprintln!("\nExamples:");
     eprintln!("  zz data ls -al              # Runs 'ls -al' in the best match for 'data'");
@@ -31,6 +35,10 @@ fn print_usage() {
         "  zz data@fix-foo ls          # Uses the worktree for branch 'fix-foo' in the 'data' repo"
     );
     eprintln!("  zz -w fix-foo data ls       # Same, using the explicit flag");
+    eprintln!("  zz -s test data             # Interactive picker pre-filtered to 'test' commands");
+    eprintln!(
+        "  zz --success-only data      # Interactive picker showing only commands that usually succeed"
+    );
     eprintln!(
         "  zz proj                     # Uses aztarna + fzf to pick a previous command, or drops to shell"
     );
@@ -130,17 +138,27 @@ fn load_env_files(dir: &Path) {
     let _ = dotenvy::from_filename_override(dir.join(".env.local"));
 }
 
-fn interactive_aztarna_fzf(target_dir: &Path) -> Option<String> {
+fn interactive_aztarna_fzf(
+    target_dir: &Path,
+    search_term: Option<&str>,
+    success_only: bool,
+) -> Option<String> {
     let target_dir_str = target_dir.to_string_lossy();
 
-    // Call aztarna top --json --cwd <dir>
-    let output = Command::new("aztarna")
-        .arg("top")
+    // Call aztarna top --json --cwd <dir> [--query <term>] [--success-only]
+    let mut cmd = Command::new("aztarna");
+    cmd.arg("top")
         .arg("--json")
         .arg("--cwd")
-        .arg(&*target_dir_str)
-        .output()
-        .ok()?;
+        .arg(&*target_dir_str);
+    if let Some(term) = search_term {
+        cmd.arg("--query").arg(term);
+    }
+    if success_only {
+        cmd.arg("--success-only");
+    }
+
+    let output = cmd.output().ok()?;
 
     if !output.status.success() {
         return None;
@@ -195,6 +213,8 @@ fn main() {
 
     let mut use_git_root = false;
     let mut worktree_branch: Option<String> = None;
+    let mut search_term: Option<String> = None;
+    let mut success_only = false;
     let mut positional: Vec<String> = Vec::new();
     let mut parsing_flags = true;
 
@@ -212,6 +232,15 @@ fn main() {
                     }
                     worktree_branch = Some(args[i].clone());
                 }
+                "-s" | "--search" => {
+                    i += 1;
+                    if i >= args.len() {
+                        eprintln!("zz: --search requires a search term");
+                        exit(1);
+                    }
+                    search_term = Some(args[i].clone());
+                }
+                "--success-only" => success_only = true,
                 "-h" | "--help" => print_usage(),
                 "-V" | "--version" => {
                     println!("zz {}", env!("CARGO_PKG_VERSION"));
@@ -293,7 +322,9 @@ fn main() {
 
     if cmd_args.is_empty() {
         // Try interactive aztarna + fzf selection first
-        if let Some(selected_cmd) = interactive_aztarna_fzf(&final_dir) {
+        if let Some(selected_cmd) =
+            interactive_aztarna_fzf(&final_dir, search_term.as_deref(), success_only)
+        {
             println!("zz: running `{}` in {}", selected_cmd, final_dir.display());
 
             // Execute the selected command by passing it to the shell
