@@ -1,0 +1,60 @@
+#compdef zz
+# zsh completion for zz — https://github.com/enekos/zz
+#
+# Install: place this file anywhere on your $fpath
+#   (e.g. ~/.oh-my-zsh/custom/completions/_zz) and run `compinit`.
+# IMPORTANT: remove any `compdef __zoxide_z_complete zz` line from your zshrc —
+# it binds zz to zoxide's directory completer and overrides this file.
+
+# Branch candidates zz can jump to: wt-managed worktrees + the current repo's
+# worktrees. Best-effort, silent on failure.
+_zz_branches() {
+  local -a br
+  if (( $+commands[wt] )); then
+    br+=(${(f)"$(wt ls 2>/dev/null | awk 'NR>1 && $1 !~ /^#/ {print $1}')"})
+  fi
+  br+=(${(f)"$(git worktree list --porcelain 2>/dev/null \
+        | awk '/^branch /{sub(/^refs\/heads\//,"",$2); print $2}')"})
+  compadd -- ${(u)br}
+}
+
+# zoxide directory candidates, shown by basename (what you'd actually type).
+_zz_dirs() {
+  local -a dirs cands
+  local -A seen
+  local d base
+  dirs=(${(f)"$(zoxide query --list 2>/dev/null)"})
+  for d in $dirs; do
+    base=${d:t}
+    [[ -n $base && -z ${seen[$base]} ]] && { cands+=$base; seen[$base]=1 }
+  done
+  compadd -- $cands
+}
+
+# First positional: `query`, or `query@branch` (complete branches of that repo).
+_zz_query() {
+  local cur=$words[CURRENT]
+  if [[ $cur == *@* ]]; then
+    local q=${cur%@*} dir
+    local -a br
+    dir=$(zoxide query "$q" 2>/dev/null)
+    [[ -n $dir ]] && br=(${(f)"$(git -C "$dir" worktree list --porcelain 2>/dev/null \
+          | awk '/^branch /{sub(/^refs\/heads\//,"",$2); print $2}')"})
+    compadd -P "${q}@" -- $br
+  else
+    _zz_dirs
+  fi
+}
+
+_arguments -C \
+  '(-r --root)'{-r,--root}'[run at the git root of the resolved dir]' \
+  '(-w --worktree)'{-w,--worktree}'[use the worktree for BRANCH]:branch:_zz_branches' \
+  '(-c --create)'{-c,--create}'[create the worktree via wt if missing]' \
+  '(-p --print)'{-p,--print}'[print the resolved directory and exit]' \
+  '(-s --search)'{-s,--search}'[pre-filter aztarna suggestions]:term:' \
+  '--success-only[only show commands that exited successfully]' \
+  '(-V --version)'{-V,--version}'[print version]' \
+  '(-h --help)'{-h,--help}'[show help]' \
+  '1:query:_zz_query' \
+  '*::command:_normal' \
+  && return 0
