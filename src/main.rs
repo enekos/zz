@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::env;
 use std::io::{self, IsTerminal, Write};
 use std::os::unix::process::CommandExt;
@@ -10,18 +10,67 @@ struct TopRow {
     last_command: String,
 }
 
+#[derive(Serialize)]
+struct WorktreeEntry {
+    branch: String,
+    path: String,
+}
+
+/// Result of resolving a (possibly partial) branch fragment against a repo's worktrees.
+#[derive(Debug, PartialEq)]
+enum WorktreeMatch {
+    /// Exactly one worktree matched — here is its path.
+    Found(PathBuf),
+    /// The fragment matched more than one worktree; carries the candidate branches.
+    Ambiguous(Vec<String>),
+    /// Nothing matched.
+    NotFound,
+}
+
+/// Resolve a branch fragment against a repo's worktrees, most-specific first:
+/// exact name > unique prefix > unique substring. An exact match always wins,
+/// even when the fragment is also a prefix of other branches. If a tier matches
+/// several worktrees and no more-specific tier resolves it, the match is
+/// `Ambiguous` so callers can fail deterministically instead of guessing.
+fn match_worktree(worktrees: &[(String, PathBuf)], fragment: &str) -> WorktreeMatch {
+    // 1. Exact branch name.
+    if let Some((_, path)) = worktrees.iter().find(|(b, _)| b == fragment) {
+        return WorktreeMatch::Found(path.clone());
+    }
+    // 2. Prefix match.
+    let prefix: Vec<&(String, PathBuf)> =
+        worktrees.iter().filter(|(b, _)| b.starts_with(fragment)).collect();
+    match prefix.as_slice() {
+        [only] => return WorktreeMatch::Found(only.1.clone()),
+        [_, ..] => {
+            return WorktreeMatch::Ambiguous(prefix.iter().map(|(b, _)| b.clone()).collect());
+        }
+        [] => {}
+    }
+    // 3. Substring match.
+    let sub: Vec<&(String, PathBuf)> =
+        worktrees.iter().filter(|(b, _)| b.contains(fragment)).collect();
+    match sub.as_slice() {
+        [only] => WorktreeMatch::Found(only.1.clone()),
+        [_, ..] => WorktreeMatch::Ambiguous(sub.iter().map(|(b, _)| b.clone()).collect()),
+        [] => WorktreeMatch::NotFound,
+    }
+}
+
 fn print_usage() {
     eprintln!("zz - Run commands in directories via zoxide");
     eprintln!(
-        "Usage: zz [-r|--root] [-w|--worktree <branch>] [-c|--create] [-p|--print]\n          [-s|--search <term>] [--success-only] [-V|--version] <query>[@branch] [command...]"
+        "Usage: zz [-r|--root] [-w|--worktree <branch>] [-c|--create] [-p|--print]\n          [-s|--search <term>] [--success-only] [-W|--worktrees] [--json]\n          [-V|--version] <query>[@branch] [command...]"
     );
     eprintln!("\nOptions:");
     eprintln!(
         "  -r, --root              Execute command at the git root of the resolved directory"
     );
-    eprintln!("  -w, --worktree <branch> Use a specific git worktree for the resolved repository");
+    eprintln!("  -w, --worktree <branch> Use a specific git worktree (branch may be a partial match)");
+    eprintln!("  -W, --worktrees         List the resolved repo's worktrees and exit (agent-safe)");
+    eprintln!("      --json              With -W, print the worktree list as JSON");
     eprintln!(
-        "  -c, --create            If the worktree is missing, create it via `wt new <branch>`"
+        "  -c, --create            If the worktree is missing, create it with `git worktree add`"
     );
     eprintln!(
         "  -p, --print             Print the fully-resolved directory and exit (run nothing)"
@@ -44,11 +93,20 @@ fn print_usage() {
         "  zz data@fix-foo ls          # Uses the worktree for branch 'fix-foo' in the 'data' repo"
     );
     eprintln!(
+        "  zz data@fix ls              # Partial match: resolves the sole 'fix*' worktree"
+    );
+    eprintln!(
+        "  zz -W data                  # List the 'data' repo's worktrees (branch<TAB>path)"
+    );
+    eprintln!(
+        "  zz -W --json data           # Same, machine-readable for agents"
+    );
+    eprintln!(
         "  zz data@?                   # Interactive picker over the 'data' repo's worktrees"
     );
     eprintln!("  zz -w fix-foo data ls       # Same, using the explicit flag");
     eprintln!(
-        "  zz -c -w new-br data ls     # Create the worktree via `wt new` first if it's missing"
+        "  zz -c -w new-br data ls     # Create the worktree (git worktree add) first if it's missing"
     );
     eprintln!("  zz -s test data             # Interactive picker pre-filtered to 'test' commands");
     eprintln!(
@@ -119,13 +177,6 @@ fn list_worktrees(repo_root: &Path) -> Vec<(String, PathBuf)> {
     }
 }
 
-fn find_worktree_path(repo_root: &Path, branch: &str) -> Option<PathBuf> {
-    list_worktrees(repo_root)
-        .into_iter()
-        .find(|(b, _)| b == branch)
-        .map(|(_, path)| path)
-}
-
 /// Interactive fzf picker over a repo's worktrees. Shows the branch, returns its path.
 fn pick_worktree_fzf(repo_root: &Path) -> Option<PathBuf> {
     let worktrees = list_worktrees(repo_root);
@@ -177,27 +228,116 @@ fn prompt_yes_no(question: &str) -> bool {
     matches!(input.trim().to_lowercase().as_str(), "y" | "yes")
 }
 
-/// Delegate worktree creation to `wt` (the lifecycle owner) and re-resolve the path.
-/// The service is guessed from the repo directory name; `wt` reports if that's wrong.
+/// The last path component of the repo root (e.g. "data"), used to name the
+/// sibling worktrees directory. Falls back to "repo" for pathological roots.
+fn repo_basename(repo_root: &Path) -> String {
+    repo_root
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "repo".to_string())
+}
+
+/// Turn a branch name into a filesystem-safe directory slug (`feat/foo` -> `feat-foo`).
+fn branch_slug(branch: &str) -> String {
+    branch.replace('/', "-")
+}
+
+/// Where a new worktree for `branch` should live. Defaults to a sibling
+/// `<repo>-worktrees/<slug>` directory (keeps worktrees out of the repo so they
+/// never clutter `git status`). Override the parent directory with
+/// `$ZZ_WORKTREE_DIR`, under which worktrees are grouped by repo name.
+fn worktree_path_for(repo_root: &Path, branch: &str) -> PathBuf {
+    let name = repo_basename(repo_root);
+    let slug = branch_slug(branch);
+    match env::var("ZZ_WORKTREE_DIR") {
+        Ok(dir) if !dir.is_empty() => PathBuf::from(dir).join(&name).join(&slug),
+        _ => {
+            let parent = repo_root.parent().unwrap_or(repo_root);
+            parent.join(format!("{}-worktrees", name)).join(&slug)
+        }
+    }
+}
+
+/// Does a local branch `refs/heads/<branch>` already exist in this repo?
+fn git_branch_exists(repo_root: &Path, branch: &str) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["rev-parse", "--verify", "--quiet", &format!("refs/heads/{}", branch)])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Base ref a brand-new branch is cut from: `$ZZ_WORKTREE_BASE` if set, else
+/// the first of `main`/`master` that exists, else the repo's current `HEAD`.
+fn default_base_branch(repo_root: &Path) -> String {
+    if let Ok(base) = env::var("ZZ_WORKTREE_BASE") {
+        if !base.is_empty() {
+            return base;
+        }
+    }
+    for candidate in ["main", "master"] {
+        if git_branch_exists(repo_root, candidate) {
+            return candidate.to_string();
+        }
+    }
+    "HEAD".to_string()
+}
+
+/// Create a git worktree for `branch` using only `git` — no external helper.
+/// The worktree is placed at `worktree_path_for(...)`. If the branch already
+/// exists it is checked out there; otherwise a new branch is created from
+/// `default_base_branch(...)`. Returns the worktree path on success.
 fn try_create_worktree(repo_root: &Path, branch: &str) -> Option<PathBuf> {
-    let svc = repo_root.file_name()?.to_string_lossy().to_string();
-    eprintln!("zz: running `wt new {} -s {}`", branch, svc);
+    let wt_path = worktree_path_for(repo_root, branch);
 
-    let status = Command::new("wt")
-        .args(["new", branch, "-s", &svc])
-        .status();
+    if wt_path.exists() {
+        eprintln!("zz: {} already exists; reusing it", wt_path.display());
+        return Some(wt_path);
+    }
 
-    match status {
-        Ok(s) if s.success() => find_worktree_path(repo_root, branch),
+    // Ensure the parent (`<repo>-worktrees/`) exists; `git worktree add` creates
+    // the leaf itself but not intermediate directories.
+    if let Some(parent) = wt_path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            eprintln!("zz: could not create {}: {}", parent.display(), e);
+            return None;
+        }
+    }
+
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(repo_root).args(["worktree", "add"]);
+    if git_branch_exists(repo_root, branch) {
+        // Existing branch: just check it out into the new worktree.
+        eprintln!(
+            "zz: creating worktree {} for existing branch '{}'",
+            wt_path.display(),
+            branch
+        );
+        cmd.arg(&wt_path).arg(branch);
+    } else {
+        // New branch cut from the base ref.
+        let base = default_base_branch(repo_root);
+        eprintln!(
+            "zz: creating worktree {} (new branch '{}' from '{}')",
+            wt_path.display(),
+            branch,
+            base
+        );
+        cmd.arg("-b").arg(branch).arg(&wt_path).arg(&base);
+    }
+
+    match cmd.status() {
+        Ok(s) if s.success() => Some(wt_path),
         Ok(_) => {
-            eprintln!("zz: `wt new {}` failed", branch);
+            eprintln!("zz: `git worktree add` failed for branch '{}'", branch);
             None
         }
         Err(e) => {
-            eprintln!(
-                "zz: could not run `wt` ({}); is it installed and on PATH?",
-                e
-            );
+            eprintln!("zz: could not run git ({}); is it installed and on PATH?", e);
             None
         }
     }
@@ -289,6 +429,8 @@ fn main() {
     let mut print_only = false;
     let mut search_term: Option<String> = None;
     let mut success_only = false;
+    let mut list_worktrees_mode = false;
+    let mut json_output = false;
     let mut positional: Vec<String> = Vec::new();
     let mut parsing_flags = true;
 
@@ -317,6 +459,8 @@ fn main() {
                     search_term = Some(args[i].clone());
                 }
                 "--success-only" => success_only = true,
+                "-W" | "--worktrees" => list_worktrees_mode = true,
+                "--json" => json_output = true,
                 "-h" | "--help" => print_usage(),
                 "-V" | "--version" => {
                     println!("zz {}", env!("CARGO_PKG_VERSION"));
@@ -336,6 +480,11 @@ fn main() {
 
     if positional.is_empty() {
         print_usage();
+    }
+
+    if json_output && !list_worktrees_mode {
+        eprintln!("zz: --json is only valid together with -W/--worktrees");
+        exit(1);
     }
 
     let raw_query = &positional[0];
@@ -368,6 +517,35 @@ fn main() {
         resolved_path
     };
 
+    // -W/--worktrees: list the resolved repo's worktrees and exit. Never spawns
+    // fzf or a shell, so it is safe to call from an agent (non-terminal) context.
+    if list_worktrees_mode {
+        let repo_root = find_git_root(&target_dir);
+        if !repo_root.join(".git").exists() {
+            eprintln!("zz: '{}' is not in a git repository", target_dir.display());
+            exit(1);
+        }
+        let worktrees = list_worktrees(&repo_root);
+        if json_output {
+            let entries: Vec<WorktreeEntry> = worktrees
+                .iter()
+                .map(|(branch, path)| WorktreeEntry {
+                    branch: branch.clone(),
+                    path: path.display().to_string(),
+                })
+                .collect();
+            println!(
+                "{}",
+                serde_json::to_string(&entries).unwrap_or_else(|_| "[]".to_string())
+            );
+        } else {
+            for (branch, path) in &worktrees {
+                println!("{}\t{}", branch, path.display());
+            }
+        }
+        exit(0);
+    }
+
     let final_dir = match branch.as_deref() {
         Some(branch_name) => {
             let repo_root = find_git_root(&target_dir);
@@ -395,19 +573,30 @@ fn main() {
                     }
                 }
             } else {
-                match find_worktree_path(&repo_root, branch_name) {
-                    Some(wt_path) => wt_path,
-                    None => {
-                        let svc = repo_root
-                            .file_name()
-                            .map(|s| s.to_string_lossy().to_string())
-                            .unwrap_or_default();
+                match match_worktree(&list_worktrees(&repo_root), branch_name) {
+                    WorktreeMatch::Found(wt_path) => wt_path,
+                    WorktreeMatch::Ambiguous(candidates) => {
+                        eprintln!(
+                            "zz: '{}' matches {} worktrees in {}:",
+                            branch_name,
+                            candidates.len(),
+                            repo_root.display()
+                        );
+                        for candidate in &candidates {
+                            eprintln!("     {}", candidate);
+                        }
+                        eprintln!("     refine the fragment to select exactly one.");
+                        exit(1);
+                    }
+                    WorktreeMatch::NotFound => {
+                        let wt_path = worktree_path_for(&repo_root, branch_name);
                         // Create only on explicit --create, or an interactive yes.
                         let should_create = create_worktree
                             || (io::stdin().is_terminal()
                                 && prompt_yes_no(&format!(
-                                    "zz: no worktree for '{}'. create it with `wt new {} -s {}`?",
-                                    branch_name, branch_name, svc
+                                    "zz: no worktree for '{}'. create it at {}?",
+                                    branch_name,
+                                    wt_path.display()
                                 )));
                         if should_create {
                             match try_create_worktree(&repo_root, branch_name) {
@@ -420,8 +609,8 @@ fn main() {
                                 branch_name,
                                 repo_root.display()
                             );
-                            eprintln!("     create it with:  wt new {} -s {}", branch_name, svc);
-                            eprintln!("     or re-run with:  -c / --create");
+                            eprintln!("     create it with:  -c / --create");
+                            eprintln!("     (would add:      {})", wt_path.display());
                             exit(1);
                         }
                     }
@@ -536,5 +725,104 @@ mod tests {
     fn parse_worktree_porcelain_skips_detached() {
         let text = "worktree /repo\nHEAD abc123\ndetached\n";
         assert!(parse_worktree_porcelain(text).is_empty());
+    }
+
+    fn sample_worktrees() -> Vec<(String, PathBuf)> {
+        vec![
+            ("main".to_string(), PathBuf::from("/repo")),
+            ("fix-foo".to_string(), PathBuf::from("/repo/wt/fix-foo")),
+            ("fix-bar".to_string(), PathBuf::from("/repo/wt/fix-bar")),
+            (
+                "shared-gh-read".to_string(),
+                PathBuf::from("/repo/wt/shared-gh-read"),
+            ),
+        ]
+    }
+
+    #[test]
+    fn match_worktree_exact() {
+        assert_eq!(
+            match_worktree(&sample_worktrees(), "fix-foo"),
+            WorktreeMatch::Found(PathBuf::from("/repo/wt/fix-foo"))
+        );
+    }
+
+    #[test]
+    fn match_worktree_unique_prefix() {
+        // "shared" is a prefix of exactly one branch.
+        assert_eq!(
+            match_worktree(&sample_worktrees(), "shared"),
+            WorktreeMatch::Found(PathBuf::from("/repo/wt/shared-gh-read"))
+        );
+    }
+
+    #[test]
+    fn match_worktree_ambiguous_prefix() {
+        // "fix-" prefixes two branches → ambiguous, not a silent pick.
+        match match_worktree(&sample_worktrees(), "fix-") {
+            WorktreeMatch::Ambiguous(mut cands) => {
+                cands.sort();
+                assert_eq!(cands, vec!["fix-bar".to_string(), "fix-foo".to_string()]);
+            }
+            other => panic!("expected Ambiguous, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn match_worktree_unique_substring() {
+        // "gh" appears only inside shared-gh-read, not at the start.
+        assert_eq!(
+            match_worktree(&sample_worktrees(), "gh"),
+            WorktreeMatch::Found(PathBuf::from("/repo/wt/shared-gh-read"))
+        );
+    }
+
+    #[test]
+    fn match_worktree_ambiguous_substring() {
+        // "fix" is a substring of two branches (neither exact nor unique prefix here).
+        match match_worktree(&sample_worktrees(), "fix") {
+            WorktreeMatch::Ambiguous(cands) => assert_eq!(cands.len(), 2),
+            other => panic!("expected Ambiguous, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn match_worktree_exact_beats_prefix() {
+        // A branch that is both an exact match and a prefix of another resolves
+        // to the exact one, never Ambiguous.
+        let wts = vec![
+            ("feat".to_string(), PathBuf::from("/repo/wt/feat")),
+            ("feat-2".to_string(), PathBuf::from("/repo/wt/feat-2")),
+        ];
+        assert_eq!(
+            match_worktree(&wts, "feat"),
+            WorktreeMatch::Found(PathBuf::from("/repo/wt/feat"))
+        );
+    }
+
+    #[test]
+    fn branch_slug_replaces_slashes() {
+        assert_eq!(branch_slug("fix-foo"), "fix-foo");
+        assert_eq!(branch_slug("feat/thread-pagination"), "feat-thread-pagination");
+        assert_eq!(branch_slug("a/b/c"), "a-b-c");
+    }
+
+    #[test]
+    fn worktree_path_default_is_sibling_dir() {
+        // With ZZ_WORKTREE_DIR unset, worktrees live in a sibling `<repo>-worktrees/<slug>`.
+        // SAFETY: single-threaded test; we remove the var we might have set.
+        unsafe { env::remove_var("ZZ_WORKTREE_DIR") };
+        assert_eq!(
+            worktree_path_for(Path::new("/home/u/proj/data"), "feat/x"),
+            PathBuf::from("/home/u/proj/data-worktrees/feat-x")
+        );
+    }
+
+    #[test]
+    fn match_worktree_not_found() {
+        assert_eq!(
+            match_worktree(&sample_worktrees(), "nope"),
+            WorktreeMatch::NotFound
+        );
     }
 }

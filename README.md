@@ -6,6 +6,8 @@ A tiny Rust CLI that combines [`zoxide`](https://github.com/ajeetdsouza/zoxide) 
 zz proj cargo test
 zz data pnpm dev
 zz -w fix-foo data pnpm test   # jump to a git worktree
+zz data@shared pnpm test       # partial branch match — no need for the full name
+zz -W --json data              # list the repo's worktrees (agent-safe, JSON)
 cd "$(zz -p data@fix-foo)"     # -p prints the resolved path, runs nothing
 ```
 
@@ -44,7 +46,7 @@ The install script builds the release binary, copies it to `~/.local/bin`, and i
 ## Usage
 
 ```bash
-zz [-r|--root] [-w|--worktree <branch>] [-c|--create] [-p|--print] [-s|--search <term>] [--success-only] <query>[@branch] [command...]
+zz [-r|--root] [-w|--worktree <branch>] [-c|--create] [-p|--print] [-W|--worktrees] [--json] [-s|--search <term>] [--success-only] <query>[@branch] [command...]
 ```
 
 - `<query>` is passed straight to `zoxide query` to resolve the best-matching directory.
@@ -52,8 +54,10 @@ zz [-r|--root] [-w|--worktree <branch>] [-c|--create] [-p|--print] [-s|--search 
 - `-r`, `--root` — walk up to the `.git` root of the resolved directory before running the command.
 - `-w <branch>`, `--worktree <branch>` — resolve the repository, then switch to the git worktree for that branch before running the command.
 - `<query>@<branch>` — shorthand for the above (`zz data@fix-foo pnpm test`).
+- **Partial branch matching** — the branch in `@branch` / `-w` need not be exact. `zz` resolves it most-specific-first: exact name → unique prefix → unique substring. An exact name always wins. If the fragment matches more than one worktree, `zz` lists the candidates and exits non-zero instead of guessing (`zz data@shared` → the sole `shared*` worktree).
+- `-W`, `--worktrees` — list the resolved repo's worktrees as `branch<TAB>path` and exit. Never spawns `fzf` or a shell, so it's safe from a script or agent. Add `--json` to emit `[{"branch": "...", "path": "..."}]`.
 - `<query>@?` — interactive `fzf` picker over that repo's worktrees (terminal only).
-- `-c`, `--create` — if the requested worktree is missing, create it by delegating to `wt new <branch>` (service guessed from the repo dir name), then run there. Without `-c`, a missing worktree prompts y/N in a terminal, or errors with the exact `wt new` command otherwise.
+- `-c`, `--create` — if the requested worktree is missing, create it with plain `git worktree add` (no external helper) into a sibling `<repo>-worktrees/<branch-slug>` dir, then run there. An existing branch is checked out; a new branch is cut from the base ref (`main` → `master` → current `HEAD`). Without `-c`, a missing worktree prompts y/N in a terminal, or errors with the path it would create otherwise. Set `ZZ_WORKTREE_DIR` to relocate worktrees (grouped by repo name) and `ZZ_WORKTREE_BASE` to change the base ref for new branches.
 - `-p`, `--print` — print the fully-resolved directory and exit without running anything. Composes: `cd "$(zz -p data@fix)"`, `git -C "$(zz -p data)" log`.
 - `-s <term>`, `--search <term>` — in interactive mode, pre-filter `aztarna` suggestions to commands containing `<term>`.
 - `--success-only` — in interactive mode, only show `aztarna` commands that exited successfully.
@@ -73,6 +77,13 @@ zz -r meta pnpm dev
 # Jump to a specific worktree and run tests there
 zz data@fix-foo pnpm test
 zz -w fix-foo data pnpm test
+
+# Don't know the exact branch? A unique fragment resolves it
+zz data@shared pnpm test
+
+# List a repo's worktrees (agent/script-safe — no fzf, no shell)
+zz -W data
+zz -W --json data
 
 # Pick a worktree interactively, then create one if it's missing
 zz data@? pnpm test
