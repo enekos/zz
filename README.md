@@ -13,14 +13,29 @@ cd "$(zz -p data@fix-foo)"     # -p prints the resolved path, runs nothing
 
 ## Installation
 
+### One line (prebuilt binary — no Rust needed)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/enekos/zz/main/install.sh | bash
+```
+
+This downloads the right prebuilt binary for your platform from the latest
+[release](https://github.com/enekos/zz/releases), drops it in `~/.local/bin`, and
+installs shell completions. Supported: macOS (Apple Silicon & Intel) and Linux
+(x86_64 & arm64, static musl).
+
+Overrides: `INSTALL_DIR` (install location), `ZZ_VERSION` (pin a tag like `v0.3.0`),
+`ZSH_COMPLETION_DIR` (completion location).
+
 ### Prerequisites
 
-- [Rust](https://www.rust-lang.org/tools/install)
 - [`zoxide`](https://github.com/ajeetdsouza/zoxide) — required for directory resolution
 - (Optional) [`fzf`](https://github.com/junegunn/fzf) — for interactive command history
 - (Optional) `aztarna` — for project-specific command suggestions (falls back to a shell if unavailable)
 
 ### From source
+
+Needs a [Rust toolchain](https://www.rust-lang.org/tools/install):
 
 ```bash
 git clone https://github.com/enekos/zz.git
@@ -28,13 +43,7 @@ cd zz
 cargo install --path .
 ```
 
-Or use the provided install script:
-
-```bash
-./install.sh
-```
-
-The install script builds the release binary, copies it to `~/.local/bin`, and installs the zsh completion. If you had a `compdef ... zz` line binding `zz` to zoxide's completer, remove it — it overrides the bundled `_zz`.
+If you had a `compdef ... zz` line binding `zz` to zoxide's completer, remove it — it overrides the bundled `_zz`.
 
 ### Shell completions
 
