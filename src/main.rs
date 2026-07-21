@@ -27,40 +27,69 @@ enum WorktreeMatch {
     NotFound,
 }
 
-/// Resolve a branch fragment against a repo's worktrees, most-specific first:
+/// Result of matching a fragment against a set of names, most-specific first.
+#[derive(Debug, PartialEq)]
+enum NameMatch {
+    /// Exactly one candidate matched — here is its index.
+    Found(usize),
+    /// The fragment matched more than one candidate; carries their indices.
+    Ambiguous(Vec<usize>),
+    /// Nothing matched.
+    NotFound,
+}
+
+/// Match a fragment against candidate names, most-specific first:
 /// exact name > unique prefix > unique substring. An exact match always wins,
-/// even when the fragment is also a prefix of other branches. If a tier matches
-/// several worktrees and no more-specific tier resolves it, the match is
+/// even when the fragment is also a prefix of other names. If a tier matches
+/// several names and no more-specific tier resolves it, the match is
 /// `Ambiguous` so callers can fail deterministically instead of guessing.
-fn match_worktree(worktrees: &[(String, PathBuf)], fragment: &str) -> WorktreeMatch {
-    // 1. Exact branch name.
-    if let Some((_, path)) = worktrees.iter().find(|(b, _)| b == fragment) {
-        return WorktreeMatch::Found(path.clone());
+fn match_names(names: &[&str], fragment: &str) -> NameMatch {
+    // 1. Exact name.
+    if let Some(i) = names.iter().position(|n| *n == fragment) {
+        return NameMatch::Found(i);
     }
     // 2. Prefix match.
-    let prefix: Vec<&(String, PathBuf)> =
-        worktrees.iter().filter(|(b, _)| b.starts_with(fragment)).collect();
+    let prefix: Vec<usize> = names
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| n.starts_with(fragment))
+        .map(|(i, _)| i)
+        .collect();
     match prefix.as_slice() {
-        [only] => return WorktreeMatch::Found(only.1.clone()),
-        [_, ..] => {
-            return WorktreeMatch::Ambiguous(prefix.iter().map(|(b, _)| b.clone()).collect());
-        }
+        [only] => return NameMatch::Found(*only),
+        [_, ..] => return NameMatch::Ambiguous(prefix),
         [] => {}
     }
     // 3. Substring match.
-    let sub: Vec<&(String, PathBuf)> =
-        worktrees.iter().filter(|(b, _)| b.contains(fragment)).collect();
+    let sub: Vec<usize> = names
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| n.contains(fragment))
+        .map(|(i, _)| i)
+        .collect();
     match sub.as_slice() {
-        [only] => WorktreeMatch::Found(only.1.clone()),
-        [_, ..] => WorktreeMatch::Ambiguous(sub.iter().map(|(b, _)| b.clone()).collect()),
-        [] => WorktreeMatch::NotFound,
+        [only] => NameMatch::Found(*only),
+        [_, ..] => NameMatch::Ambiguous(sub),
+        [] => NameMatch::NotFound,
+    }
+}
+
+/// Resolve a branch fragment against a repo's worktrees using `match_names`.
+fn match_worktree(worktrees: &[(String, PathBuf)], fragment: &str) -> WorktreeMatch {
+    let names: Vec<&str> = worktrees.iter().map(|(b, _)| b.as_str()).collect();
+    match match_names(&names, fragment) {
+        NameMatch::Found(i) => WorktreeMatch::Found(worktrees[i].1.clone()),
+        NameMatch::Ambiguous(idx) => {
+            WorktreeMatch::Ambiguous(idx.iter().map(|i| worktrees[*i].0.clone()).collect())
+        }
+        NameMatch::NotFound => WorktreeMatch::NotFound,
     }
 }
 
 fn print_usage() {
     eprintln!("zz - Run commands in directories via zoxide");
     eprintln!(
-        "Usage: zz [-r|--root] [-w|--worktree <branch>] [-c|--create] [-p|--print]\n          [-s|--search <term>] [--success-only] [-W|--worktrees] [--json]\n          [-V|--version] <query>[@branch] [command...]"
+        "Usage: zz [-r|--root] [-w|--worktree <branch>] [-c|--create] [-t|--track] [-p|--print]\n          [-s|--search <term>] [--success-only] [-W|--worktrees] [--json]\n          [-V|--version] <query>[@branch] [command...]"
     );
     eprintln!("\nOptions:");
     eprintln!(
@@ -71,6 +100,9 @@ fn print_usage() {
     eprintln!("      --json              With -W, print the worktree list as JSON");
     eprintln!(
         "  -c, --create            If the worktree is missing, create it with `git worktree add`"
+    );
+    eprintln!(
+        "  -t, --track             Create the worktree from a remote branch (fetch + `git worktree add --track`)"
     );
     eprintln!(
         "  -p, --print             Print the fully-resolved directory and exit (run nothing)"
@@ -108,12 +140,21 @@ fn print_usage() {
     eprintln!(
         "  zz -c -w new-br data ls     # Create the worktree (git worktree add) first if it's missing"
     );
+    eprintln!(
+        "  zz -t data@feat-x ls        # Fetch 'feat-x' from a remote and track it in a new worktree"
+    );
+    eprintln!(
+        "  zz fix-foo ls               # No zoxide match: finds the 'fix-foo' worktree in any known repo"
+    );
     eprintln!("  zz -s test data             # Interactive picker pre-filtered to 'test' commands");
     eprintln!(
         "  zz --success-only data      # Interactive picker showing only commands that usually succeed"
     );
     eprintln!(
         "  zz proj                     # Uses aztarna + fzf to pick a previous command, or drops to shell"
+    );
+    eprintln!(
+        "\nWhen the plain query matches nothing in zoxide, zz scans the worktrees of every repo\nzoxide knows and matches branch/dir names — worktrees are discoverable before the first\nvisit. Worktrees zz jumps to are taught to zoxide (zoxide add), building frecency."
     );
     exit(1);
 }
@@ -129,6 +170,77 @@ fn find_git_root(start: &Path) -> PathBuf {
             None => return start.to_path_buf(), // Fallback to start if no .git found
         }
     }
+}
+
+/// Like `find_git_root`, but returns None when no `.git` is found walking up.
+fn find_git_root_opt(start: &Path) -> Option<PathBuf> {
+    let mut current = start;
+    loop {
+        if current.join(".git").exists() {
+            return Some(current.to_path_buf());
+        }
+        current = current.parent()?;
+    }
+}
+
+/// Every directory zoxide knows, best-ranked first.
+fn zoxide_dirs() -> Vec<PathBuf> {
+    let output = Command::new("zoxide").args(["query", "--list"]).output();
+    match output {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|l| PathBuf::from(l.trim()))
+            .filter(|p| !p.as_os_str().is_empty())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn push_unique(candidates: &mut Vec<(String, PathBuf)>, name: String, path: &Path) {
+    if !candidates.iter().any(|(n, p)| n == &name && p == path) {
+        candidates.push((name, path.to_path_buf()));
+    }
+}
+
+/// All linked-worktree (name, path) candidates across every repo zoxide knows,
+/// where name is both the branch and the worktree dir basename. This is the
+/// corpus for zoxide-like worktree discovery when the plain query matches
+/// nothing in zoxide — it makes worktrees findable before the first visit.
+/// The main checkout of each repo is excluded: it's already in zoxide's db.
+fn collect_worktree_candidates() -> Vec<(String, PathBuf)> {
+    let mut seen_roots: Vec<PathBuf> = Vec::new();
+    let mut candidates: Vec<(String, PathBuf)> = Vec::new();
+    for dir in zoxide_dirs() {
+        let Some(root) = find_git_root_opt(&dir) else {
+            continue;
+        };
+        if seen_roots.contains(&root) {
+            continue;
+        }
+        seen_roots.push(root.clone());
+        for (branch, path) in list_worktrees(&root) {
+            // Linked worktrees have a `.git` file; the main checkout has a dir.
+            if !path.join(".git").is_file() {
+                continue;
+            }
+            push_unique(&mut candidates, branch, &path);
+            if let Some(base) = path.file_name() {
+                push_unique(&mut candidates, base.to_string_lossy().into_owned(), &path);
+            }
+        }
+    }
+    candidates
+}
+
+/// Teach zoxide about a path (frecency learning). Best-effort, silent.
+fn zoxide_add(path: &Path) {
+    let _ = Command::new("zoxide")
+        .arg("add")
+        .arg(path.as_os_str())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 fn split_query_branch(raw: &str) -> (String, Option<String>) {
@@ -343,6 +455,165 @@ fn try_create_worktree(repo_root: &Path, branch: &str) -> Option<PathBuf> {
     }
 }
 
+/// Parse `git ls-remote --heads` output into branch names.
+fn parse_ls_remote_heads(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|line| {
+            let (_, refname) = line.split_once('\t')?;
+            refname
+                .strip_prefix("refs/heads/")
+                .map(|s| s.to_string())
+        })
+        .collect()
+}
+
+/// (remote, branch) for every branch on every remote, via `git ls-remote` so
+/// branches never fetched locally are still discovered.
+fn remote_branch_candidates(repo_root: &Path) -> Vec<(String, String)> {
+    let remotes_out = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .arg("remote")
+        .output();
+    let Ok(remotes_out) = remotes_out else {
+        return Vec::new();
+    };
+    if !remotes_out.status.success() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for remote in String::from_utf8_lossy(&remotes_out.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+    {
+        let ls = Command::new("git")
+            .arg("-C")
+            .arg(repo_root)
+            .args(["ls-remote", "--heads", remote])
+            .output();
+        let Ok(ls) = ls else { continue };
+        if !ls.status.success() {
+            continue;
+        }
+        for branch in parse_ls_remote_heads(&String::from_utf8_lossy(&ls.stdout)) {
+            out.push((remote.to_string(), branch));
+        }
+    }
+    out
+}
+
+/// Create a worktree tracking a remote branch. The fragment is matched against
+/// remote branch names (fresh `git ls-remote` per remote) with the same
+/// exact > unique-prefix > unique-substring tiers as local worktrees; a unique
+/// match is fetched and added with `git worktree add --track -b`. Returns the
+/// worktree path on success.
+fn try_track_remote_worktree(repo_root: &Path, fragment: &str) -> Option<PathBuf> {
+    let candidates = remote_branch_candidates(repo_root);
+    if candidates.is_empty() {
+        eprintln!(
+            "zz: no remotes (or no remote branches) found in {}",
+            repo_root.display()
+        );
+        return None;
+    }
+    // Several remotes may carry the same branch name — keep one entry per
+    // branch, preferring `origin`.
+    let mut names: Vec<String> = Vec::new();
+    let mut remotes: Vec<String> = Vec::new();
+    for (remote, branch) in candidates {
+        if let Some(pos) = names.iter().position(|n| *n == branch) {
+            if remote == "origin" {
+                remotes[pos] = remote;
+            }
+        } else {
+            names.push(branch);
+            remotes.push(remote);
+        }
+    }
+    let refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+    let (branch, remote) = match match_names(&refs, fragment) {
+        NameMatch::Found(i) => (names[i].clone(), remotes[i].clone()),
+        NameMatch::Ambiguous(idx) => {
+            eprintln!(
+                "zz: '{}' matches {} remote branches in {}:",
+                fragment,
+                idx.len(),
+                repo_root.display()
+            );
+            for i in idx {
+                eprintln!("     {}/{}", remotes[i], names[i]);
+            }
+            eprintln!("     refine the fragment to select exactly one.");
+            return None;
+        }
+        NameMatch::NotFound => {
+            eprintln!(
+                "zz: no remote branch matching '{}' in {}",
+                fragment,
+                repo_root.display()
+            );
+            eprintln!("     create a new local branch instead with:  -c / --create");
+            return None;
+        }
+    };
+
+    let wt_path = worktree_path_for(repo_root, &branch);
+    if wt_path.exists() {
+        eprintln!("zz: {} already exists; reusing it", wt_path.display());
+        return Some(wt_path);
+    }
+    if let Some(parent) = wt_path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            eprintln!("zz: could not create {}: {}", parent.display(), e);
+            return None;
+        }
+    }
+
+    eprintln!("zz: fetching '{}' from {}", branch, remote);
+    match Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["fetch", &remote, &branch])
+        .status()
+    {
+        Ok(s) if s.success() => {}
+        Ok(_) => {
+            eprintln!("zz: `git fetch {} {}` failed", remote, branch);
+            return None;
+        }
+        Err(e) => {
+            eprintln!("zz: could not run git ({}); is it installed and on PATH?", e);
+            return None;
+        }
+    }
+
+    eprintln!(
+        "zz: creating worktree {} tracking {}/{}",
+        wt_path.display(),
+        remote,
+        branch
+    );
+    match Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["worktree", "add", "--track", "-b", &branch])
+        .arg(&wt_path)
+        .arg(format!("{}/{}", remote, branch))
+        .status()
+    {
+        Ok(s) if s.success() => Some(wt_path),
+        Ok(_) => {
+            eprintln!("zz: `git worktree add` failed for branch '{}'", branch);
+            None
+        }
+        Err(e) => {
+            eprintln!("zz: could not run git ({}); is it installed and on PATH?", e);
+            None
+        }
+    }
+}
+
 fn load_env_files(dir: &Path) {
     // Attempt to load .env and .env.local in the target directory
     // We ignore errors since the files might not exist or be readable.
@@ -426,6 +697,7 @@ fn main() {
     let mut use_git_root = false;
     let mut worktree_branch: Option<String> = None;
     let mut create_worktree = false;
+    let mut track_remote = false;
     let mut print_only = false;
     let mut search_term: Option<String> = None;
     let mut success_only = false;
@@ -449,6 +721,7 @@ fn main() {
                     worktree_branch = Some(args[i].clone());
                 }
                 "-c" | "--create" => create_worktree = true,
+                "-t" | "--track" => track_remote = true,
                 "-p" | "--print" => print_only = true,
                 "-s" | "--search" => {
                     i += 1;
@@ -493,6 +766,15 @@ fn main() {
     let (query, branch_from_query) = split_query_branch(raw_query);
     let branch = worktree_branch.or(branch_from_query);
 
+    if track_remote && branch.is_none() {
+        eprintln!("zz: --track requires a branch (via -w/--worktree or <query>@<branch>)");
+        exit(1);
+    }
+    if track_remote && list_worktrees_mode {
+        eprintln!("zz: --track does not apply to -W/--worktrees");
+        exit(1);
+    }
+
     // Use zoxide to find the target directory
     let output = Command::new("zoxide").arg("query").arg(&query).output();
 
@@ -505,12 +787,47 @@ fn main() {
         }
     };
 
-    if !output.status.success() {
+    // True when the final directory came from a worktree resolution — used for
+    // frecency learning (`zoxide add`) right before we land there.
+    let mut via_worktree = false;
+
+    let resolved_path = if output.status.success() {
+        PathBuf::from(String::from_utf8_lossy(&output.stdout).trim())
+    } else if branch.is_none() && !list_worktrees_mode && !query.is_empty() {
+        // Zoxide knows nothing for this query. Before giving up, do zoxide-like
+        // discovery over the linked worktrees of every repo zoxide *does* know,
+        // matching branch and dir names — so worktrees are findable even if
+        // they've never been visited.
+        let candidates = collect_worktree_candidates();
+        let names: Vec<&str> = candidates.iter().map(|(n, _)| n.as_str()).collect();
+        match match_names(&names, &query) {
+            NameMatch::Found(i) => {
+                via_worktree = true;
+                eprintln!(
+                    "zz: no zoxide match for '{}'; using worktree '{}' ({})",
+                    query,
+                    candidates[i].0,
+                    candidates[i].1.display()
+                );
+                candidates[i].1.clone()
+            }
+            NameMatch::Ambiguous(idx) => {
+                eprintln!("zz: '{}' matches {} worktrees:", query, idx.len());
+                for i in idx {
+                    eprintln!("     {}\t{}", candidates[i].0, candidates[i].1.display());
+                }
+                eprintln!("     refine the query (or use <repo>@<branch>) to select exactly one.");
+                exit(1);
+            }
+            NameMatch::NotFound => {
+                io::stderr().write_all(&output.stderr).unwrap();
+                exit(output.status.code().unwrap_or(1));
+            }
+        }
+    } else {
         io::stderr().write_all(&output.stderr).unwrap();
         exit(output.status.code().unwrap_or(1));
-    }
-
-    let resolved_path = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    };
     let target_dir = if use_git_root {
         find_git_root(&resolved_path)
     } else {
@@ -556,6 +873,7 @@ fn main() {
                 );
                 exit(1);
             }
+            via_worktree = true;
 
             if branch_name == "?" {
                 // Interactive worktree picker. Needs a terminal for fzf.
@@ -589,29 +907,40 @@ fn main() {
                         exit(1);
                     }
                     WorktreeMatch::NotFound => {
-                        let wt_path = worktree_path_for(&repo_root, branch_name);
-                        // Create only on explicit --create, or an interactive yes.
-                        let should_create = create_worktree
-                            || (io::stdin().is_terminal()
-                                && prompt_yes_no(&format!(
-                                    "zz: no worktree for '{}'. create it at {}?",
-                                    branch_name,
-                                    wt_path.display()
-                                )));
-                        if should_create {
-                            match try_create_worktree(&repo_root, branch_name) {
+                        // --track with no local branch: pull it from a remote
+                        // (fetch + `git worktree add --track`).
+                        if track_remote && !git_branch_exists(&repo_root, branch_name) {
+                            match try_track_remote_worktree(&repo_root, branch_name) {
                                 Some(path) => path,
                                 None => exit(1),
                             }
                         } else {
-                            eprintln!(
-                                "zz: no worktree for branch '{}' in {}",
-                                branch_name,
-                                repo_root.display()
-                            );
-                            eprintln!("     create it with:  -c / --create");
-                            eprintln!("     (would add:      {})", wt_path.display());
-                            exit(1);
+                            let wt_path = worktree_path_for(&repo_root, branch_name);
+                            // Create only on explicit --create/--track, or an interactive yes.
+                            let should_create = create_worktree
+                                || track_remote
+                                || (io::stdin().is_terminal()
+                                    && prompt_yes_no(&format!(
+                                        "zz: no worktree for '{}'. create it at {}?",
+                                        branch_name,
+                                        wt_path.display()
+                                    )));
+                            if should_create {
+                                match try_create_worktree(&repo_root, branch_name) {
+                                    Some(path) => path,
+                                    None => exit(1),
+                                }
+                            } else {
+                                eprintln!(
+                                    "zz: no worktree for branch '{}' in {}",
+                                    branch_name,
+                                    repo_root.display()
+                                );
+                                eprintln!("     create it with:  -c / --create");
+                                eprintln!("     track a remote:  -t / --track");
+                                eprintln!("     (would add:      {})", wt_path.display());
+                                exit(1);
+                            }
                         }
                     }
                 }
@@ -626,17 +955,23 @@ fn main() {
         exit(0);
     }
 
+    // No command given. In a non-interactive context (e.g. an agent), never
+    // spawn fzf or an interactive shell — that would hang. Print the path.
+    if cmd_args.is_empty() && !io::stdin().is_terminal() {
+        println!("{}", final_dir.display());
+        exit(0);
+    }
+
+    // Frecency learning: teach zoxide about worktrees we actually land in, so
+    // they surface in plain `z`/`zoxide query` over time.
+    if via_worktree {
+        zoxide_add(&final_dir);
+    }
+
     // Load env vars from the target directory before executing
     load_env_files(&final_dir);
 
     if cmd_args.is_empty() {
-        // No command given. In a non-interactive context (e.g. an agent), never
-        // spawn fzf or an interactive shell — that would hang. Print the path.
-        if !io::stdin().is_terminal() {
-            println!("{}", final_dir.display());
-            exit(0);
-        }
-
         // Try interactive aztarna + fzf selection first
         if let Some(selected_cmd) =
             interactive_aztarna_fzf(&final_dir, search_term.as_deref(), success_only)
@@ -824,5 +1159,21 @@ mod tests {
             match_worktree(&sample_worktrees(), "nope"),
             WorktreeMatch::NotFound
         );
+    }
+
+    #[test]
+    fn parse_ls_remote_heads_extracts_branches() {
+        let text = "a1b2c3\trefs/heads/main\n\
+                    d4e5f6\trefs/heads/feat/csrf-timing\n\
+                    789abc\trefs/pull/42/head\n";
+        assert_eq!(
+            parse_ls_remote_heads(text),
+            vec!["main".to_string(), "feat/csrf-timing".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_ls_remote_heads_empty() {
+        assert!(parse_ls_remote_heads("").is_empty());
     }
 }
