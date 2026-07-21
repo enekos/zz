@@ -23,7 +23,7 @@ _zz() {
 
   if [[ "$cur" == -* ]]; then
     COMPREPLY=( $(compgen -W \
-      "-r --root -w --worktree -c --create -p --print -W --worktrees --json -s --search --success-only -V --version -h --help" \
+      "-r --root -w --worktree -c --create -t --track -p --print -W --worktrees --json -s --search --success-only -V --version -h --help" \
       -- "$cur") )
     return
   fi

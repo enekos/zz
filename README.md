@@ -55,10 +55,12 @@ If you had a `compdef ... zz` line binding `zz` to zoxide's completer, remove it
 ## Usage
 
 ```bash
-zz [-r|--root] [-w|--worktree <branch>] [-c|--create] [-p|--print] [-W|--worktrees] [--json] [-s|--search <term>] [--success-only] <query>[@branch] [command...]
+zz [-r|--root] [-w|--worktree <branch>] [-c|--create] [-t|--track] [-p|--print] [-W|--worktrees] [--json] [-s|--search <term>] [--success-only] <query>[@branch] [command...]
 ```
 
 - `<query>` is passed straight to `zoxide query` to resolve the best-matching directory.
+- **Worktree discovery fallback** — when the plain query matches nothing in zoxide, `zz` scans the linked worktrees of every repo zoxide knows and matches branch and worktree-dir names (exact → unique prefix → unique substring). So `zz fix-foo` finds the `fix-foo` worktree even if you've never visited it. Ambiguous fragments list the candidates and exit non-zero instead of guessing.
+- **Frecency learning** — worktrees `zz` lands in are taught back to zoxide (`zoxide add`), so they climb the rankings and plain `z`/`zoxide query` learn them over time.
 - `[command...]` is the command and its arguments to run in that directory.
 - `-r`, `--root` — walk up to the `.git` root of the resolved directory before running the command.
 - `-w <branch>`, `--worktree <branch>` — resolve the repository, then switch to the git worktree for that branch before running the command.
@@ -67,6 +69,7 @@ zz [-r|--root] [-w|--worktree <branch>] [-c|--create] [-p|--print] [-W|--worktre
 - `-W`, `--worktrees` — list the resolved repo's worktrees as `branch<TAB>path` and exit. Never spawns `fzf` or a shell, so it's safe from a script or agent. Add `--json` to emit `[{"branch": "...", "path": "..."}]`.
 - `<query>@?` — interactive `fzf` picker over that repo's worktrees (terminal only).
 - `-c`, `--create` — if the requested worktree is missing, create it with plain `git worktree add` (no external helper) into a sibling `<repo>-worktrees/<branch-slug>` dir, then run there. An existing branch is checked out; a new branch is cut from the base ref (`main` → `master` → current `HEAD`). Without `-c`, a missing worktree prompts y/N in a terminal, or errors with the path it would create otherwise. Set `ZZ_WORKTREE_DIR` to relocate worktrees (grouped by repo name) and `ZZ_WORKTREE_BASE` to change the base ref for new branches.
+- `-t`, `--track` — pull a worktree for a **remote** branch: the fragment is matched against remote branch names (fresh `git ls-remote` per remote, same partial-match tiers), the unique match is fetched, and the worktree is created with `git worktree add --track -b <branch> <path> <remote>/<branch>` in the same sibling location as `-c`. If the worktree or local branch already exists, it's reused. When several remotes carry the branch, `origin` wins.
 - `-p`, `--print` — print the fully-resolved directory and exit without running anything. Composes: `cd "$(zz -p data@fix)"`, `git -C "$(zz -p data)" log`.
 - `-s <term>`, `--search <term>` — in interactive mode, pre-filter `aztarna` suggestions to commands containing `<term>`.
 - `--success-only` — in interactive mode, only show `aztarna` commands that exited successfully.
@@ -97,6 +100,12 @@ zz -W --json data
 # Pick a worktree interactively, then create one if it's missing
 zz data@? pnpm test
 zz -c -w new-feature data pnpm dev:local
+
+# Pull a worktree for a branch that only exists on the remote
+zz -t data@feat-csrf pnpm test
+
+# Jump to a worktree you've never visited — zoxide fallback finds it
+zz fix-foo pnpm test
 
 # Print the resolved path and compose with other tools (runs nothing)
 cd "$(zz -p data@fix-foo)"

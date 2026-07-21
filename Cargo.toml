@@ -1,6 +1,6 @@
 [package]
 name = "zz"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 authors = ["Eneko Sarasola"]
 description = "Run commands in directories via zoxide, with optional git worktree jumping."
