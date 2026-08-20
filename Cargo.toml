@@ -1,14 +1,19 @@
 [package]
-name = "zz"
+name = "zz-cli"
 version = "0.4.0"
 edition = "2024"
 authors = ["Eneko Sarasola"]
 description = "Run commands in directories via zoxide, with optional git worktree jumping."
 license = "MIT"
+readme = "README.md"
 repository = "https://github.com/enekos/zz"
 keywords = ["zoxide", "cd", "cli", "productivity", "worktree"]
 categories = ["command-line-utilities"]
 rust-version = "1.85"
+
+[[bin]]
+name = "zz"
+path = "src/main.rs"
 
 [dependencies]
 dotenvy = "0.15.7"

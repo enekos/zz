@@ -27,6 +27,15 @@ installs shell completions. Supported: macOS (Apple Silicon & Intel) and Linux
 Overrides: `INSTALL_DIR` (install location), `ZZ_VERSION` (pin a tag like `v0.3.0`),
 `ZSH_COMPLETION_DIR` (completion location).
 
+### From crates.io
+
+```bash
+cargo install zz-cli
+```
+
+The crate is `zz-cli`; the binary it installs is `zz`. This route builds from source and does
+not install shell completions — see below for those.
+
 ### Prerequisites
 
 - [`zoxide`](https://github.com/ajeetdsouza/zoxide) — required for directory resolution
