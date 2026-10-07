@@ -95,7 +95,9 @@ fn print_usage() {
     eprintln!(
         "  -r, --root              Execute command at the git root of the resolved directory"
     );
-    eprintln!("  -w, --worktree <branch> Use a specific git worktree (branch may be a partial match)");
+    eprintln!(
+        "  -w, --worktree <branch> Use a specific git worktree (branch may be a partial match)"
+    );
     eprintln!("  -W, --worktrees         List the resolved repo's worktrees and exit (agent-safe)");
     eprintln!("      --json              With -W, print the worktree list as JSON");
     eprintln!(
@@ -124,15 +126,9 @@ fn print_usage() {
     eprintln!(
         "  zz data@fix-foo ls          # Uses the worktree for branch 'fix-foo' in the 'data' repo"
     );
-    eprintln!(
-        "  zz data@fix ls              # Partial match: resolves the sole 'fix*' worktree"
-    );
-    eprintln!(
-        "  zz -W data                  # List the 'data' repo's worktrees (branch<TAB>path)"
-    );
-    eprintln!(
-        "  zz -W --json data           # Same, machine-readable for agents"
-    );
+    eprintln!("  zz data@fix ls              # Partial match: resolves the sole 'fix*' worktree");
+    eprintln!("  zz -W data                  # List the 'data' repo's worktrees (branch<TAB>path)");
+    eprintln!("  zz -W --json data           # Same, machine-readable for agents");
     eprintln!(
         "  zz data@?                   # Interactive picker over the 'data' repo's worktrees"
     );
@@ -375,7 +371,12 @@ fn git_branch_exists(repo_root: &Path, branch: &str) -> bool {
     Command::new("git")
         .arg("-C")
         .arg(repo_root)
-        .args(["rev-parse", "--verify", "--quiet", &format!("refs/heads/{}", branch)])
+        .args([
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{}", branch),
+        ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -449,7 +450,10 @@ fn try_create_worktree(repo_root: &Path, branch: &str) -> Option<PathBuf> {
             None
         }
         Err(e) => {
-            eprintln!("zz: could not run git ({}); is it installed and on PATH?", e);
+            eprintln!(
+                "zz: could not run git ({}); is it installed and on PATH?",
+                e
+            );
             None
         }
     }
@@ -460,9 +464,7 @@ fn parse_ls_remote_heads(text: &str) -> Vec<String> {
     text.lines()
         .filter_map(|line| {
             let (_, refname) = line.split_once('\t')?;
-            refname
-                .strip_prefix("refs/heads/")
-                .map(|s| s.to_string())
+            refname.strip_prefix("refs/heads/").map(|s| s.to_string())
         })
         .collect()
 }
@@ -583,7 +585,10 @@ fn try_track_remote_worktree(repo_root: &Path, fragment: &str) -> Option<PathBuf
             return None;
         }
         Err(e) => {
-            eprintln!("zz: could not run git ({}); is it installed and on PATH?", e);
+            eprintln!(
+                "zz: could not run git ({}); is it installed and on PATH?",
+                e
+            );
             return None;
         }
     }
@@ -608,7 +613,10 @@ fn try_track_remote_worktree(repo_root: &Path, fragment: &str) -> Option<PathBuf
             None
         }
         Err(e) => {
-            eprintln!("zz: could not run git ({}); is it installed and on PATH?", e);
+            eprintln!(
+                "zz: could not run git ({}); is it installed and on PATH?",
+                e
+            );
             None
         }
     }
@@ -1138,7 +1146,10 @@ mod tests {
     #[test]
     fn branch_slug_replaces_slashes() {
         assert_eq!(branch_slug("fix-foo"), "fix-foo");
-        assert_eq!(branch_slug("feat/thread-pagination"), "feat-thread-pagination");
+        assert_eq!(
+            branch_slug("feat/thread-pagination"),
+            "feat-thread-pagination"
+        );
         assert_eq!(branch_slug("a/b/c"), "a-b-c");
     }
 
