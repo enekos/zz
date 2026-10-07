@@ -27,6 +27,18 @@ installs shell completions. Supported: macOS (Apple Silicon & Intel) and Linux
 Overrides: `INSTALL_DIR` (install location), `ZZ_VERSION` (pin a tag like `v0.3.0`),
 `ZSH_COMPLETION_DIR` (completion location).
 
+### Linux packages
+
+```bash
+yay -S zz-cli                                     # Arch, from the AUR
+sudo apt install ./zz-cli_<version>_amd64.deb       # Debian, Ubuntu
+sudo dnf install ./zz-cli-<version>-1.x86_64.rpm    # Fedora, RHEL
+sudo apk add --allow-untrusted ./zz-cli_<version>_x86_64.apk   # Alpine
+nix run github:enekos/zz                     # Nix
+```
+
+The `.deb`, `.rpm` and `.apk` files are on each [release](https://github.com/enekos/zz/releases), for x86_64 and arm64.
+
 ### From crates.io
 
 ```bash

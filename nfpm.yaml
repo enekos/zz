@@ -1,0 +1,26 @@
+name: zz-cli
+arch: ${ARCH}
+platform: linux
+version: ${VERSION}
+maintainer: Eneko Sarasola <113593779+enekos@users.noreply.github.com>
+description: "Run commands in directories via zoxide, with optional git worktree jumping."
+homepage: https://github.com/enekos/zz
+license: MIT
+depends:
+  - zoxide
+recommends:
+  - fzf
+  - git
+contents:
+  - src: dist/pkg/zz
+    dst: /usr/bin/zz
+    file_info:
+      mode: 0755
+  - src: LICENSE
+    dst: /usr/share/licenses/zz-cli/LICENSE
+  - src: README.md
+    dst: /usr/share/doc/zz-cli/README.md
+  - src: completions/_zz
+    dst: /usr/share/zsh/site-functions/_zz
+  - src: completions/zz.bash
+    dst: /usr/share/bash-completion/completions/zz
