@@ -70,9 +70,58 @@ jobs:
             zz-${{ matrix.target }}.tar.gz
             zz-${{ matrix.target }}.tar.gz.sha256
 
+  packages:
+    name: Linux packages ${{ matrix.arch }}
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            arch: amd64
+          - target: aarch64-unknown-linux-musl
+            arch: arm64
+    env:
+      NFPM_VERSION: 2.47.0
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: zz-*${{ matrix.target }}
+          path: artifact
+          merge-multiple: true
+
+      - name: Install nfpm
+        run: |
+          curl -fsSL -o nfpm.deb "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_amd64.deb"
+          sudo dpkg -i nfpm.deb
+
+      - name: Build deb, rpm and apk
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/pkg packages
+          tar -xzf artifact/*.tar.gz -C dist/pkg --strip-components=1
+          case "$GITHUB_REF_NAME" in v*) VERSION="${GITHUB_REF_NAME#v}" ;; *) VERSION=0.0.0 ;; esac
+          export VERSION ARCH="${{ matrix.arch }}"
+          for format in deb rpm apk; do
+            nfpm package --config nfpm.yaml --packager "$format" --target packages/
+          done
+          cd packages
+          for f in *; do sha256sum "$f" > "$f.sha256"; done
+          ls -l
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages-${{ matrix.arch }}
+          path: packages/*
+          if-no-files-found: error
+
   release:
     name: Publish release
-    needs: build
+    needs: [build, packages]
     runs-on: ubuntu-latest
     permissions:
       contents: write
