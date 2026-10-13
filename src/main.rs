@@ -239,6 +239,85 @@ fn zoxide_add(path: &Path) {
         .status();
 }
 
+/// A query written as a filesystem path (`/abs`, `~/x`, `./x`, `../x`, `.`, `..`)
+/// names a directory literally instead of asking zoxide to rank one. Returns the
+/// path with a leading `~` expanded, or `None` for a plain zoxide keyword.
+fn path_like_query(query: &str, home: Option<&Path>) -> Option<PathBuf> {
+    if query == "~" || query.starts_with("~/") {
+        let rest = query.trim_start_matches('~').trim_start_matches('/');
+        return home.map(|h| h.join(rest));
+    }
+    let is_path = query.starts_with('/')
+        || query.starts_with("./")
+        || query.starts_with("../")
+        || query == "."
+        || query == "..";
+    is_path.then(|| PathBuf::from(query))
+}
+
+fn existing_dir_or_exit(path: PathBuf) -> PathBuf {
+    if !path.is_dir() {
+        eprintln!("zz: '{}' is not a directory", path.display());
+        exit(1);
+    }
+    path.canonicalize().unwrap_or(path)
+}
+
+/// Resolve a keyword through zoxide, falling back to worktree discovery when
+/// `allow_discovery` is set. Exits non-zero, with a message naming the query,
+/// when nothing matches. Returns the directory and whether it is a worktree.
+fn resolve_with_zoxide(query: &str, allow_discovery: bool) -> (PathBuf, bool) {
+    let output = match Command::new("zoxide").arg("query").arg(query).output() {
+        Ok(out) => out,
+        Err(e) => {
+            eprintln!("zz: failed to execute 'zoxide': {}", e);
+            eprintln!("Is zoxide installed and in your PATH?");
+            exit(1);
+        }
+    };
+
+    if output.status.success() {
+        return (
+            PathBuf::from(String::from_utf8_lossy(&output.stdout).trim()),
+            false,
+        );
+    }
+
+    if allow_discovery && !query.is_empty() {
+        // Zoxide knows nothing for this query. Before giving up, do zoxide-like
+        // discovery over the linked worktrees of every repo zoxide *does* know,
+        // matching branch and dir names — so worktrees are findable even if
+        // they've never been visited.
+        let candidates = collect_worktree_candidates();
+        let names: Vec<&str> = candidates.iter().map(|(n, _)| n.as_str()).collect();
+        match match_names(&names, query) {
+            NameMatch::Found(i) => {
+                eprintln!(
+                    "zz: no zoxide match for '{}'; using worktree '{}' ({})",
+                    query,
+                    candidates[i].0,
+                    candidates[i].1.display()
+                );
+                return (candidates[i].1.clone(), true);
+            }
+            NameMatch::Ambiguous(idx) => {
+                eprintln!("zz: '{}' matches {} worktrees:", query, idx.len());
+                for i in idx {
+                    eprintln!("     {}\t{}", candidates[i].0, candidates[i].1.display());
+                }
+                eprintln!("     refine the query (or use <repo>@<branch>) to select exactly one.");
+                exit(1);
+            }
+            NameMatch::NotFound => {}
+        }
+    }
+
+    // Best-effort: zoxide's own reason, then ours. Nothing was printed to stdout.
+    let _ = io::stderr().write_all(&output.stderr);
+    eprintln!("zz: no directory matches '{}'", query);
+    exit(output.status.code().unwrap_or(1));
+}
+
 fn split_query_branch(raw: &str) -> (String, Option<String>) {
     if let Some(pos) = raw.rfind('@') {
         let (query, branch) = raw.split_at(pos);
@@ -443,7 +522,7 @@ fn try_create_worktree(repo_root: &Path, branch: &str) -> Option<PathBuf> {
         cmd.arg("-b").arg(branch).arg(&wt_path).arg(&base);
     }
 
-    match cmd.status() {
+    match cmd.stdout(Stdio::from(io::stderr())).status() {
         Ok(s) if s.success() => Some(wt_path),
         Ok(_) => {
             eprintln!("zz: `git worktree add` failed for branch '{}'", branch);
@@ -577,6 +656,7 @@ fn try_track_remote_worktree(repo_root: &Path, fragment: &str) -> Option<PathBuf
         .arg("-C")
         .arg(repo_root)
         .args(["fetch", &remote, &branch])
+        .stdout(Stdio::from(io::stderr()))
         .status()
     {
         Ok(s) if s.success() => {}
@@ -605,6 +685,7 @@ fn try_track_remote_worktree(repo_root: &Path, fragment: &str) -> Option<PathBuf
         .args(["worktree", "add", "--track", "-b", &branch])
         .arg(&wt_path)
         .arg(format!("{}/{}", remote, branch))
+        .stdout(Stdio::from(io::stderr()))
         .status()
     {
         Ok(s) if s.success() => Some(wt_path),
@@ -783,58 +864,12 @@ fn main() {
         exit(1);
     }
 
-    // Use zoxide to find the target directory
-    let output = Command::new("zoxide").arg("query").arg(&query).output();
-
-    let output = match output {
-        Ok(out) => out,
-        Err(e) => {
-            eprintln!("zz: failed to execute 'zoxide': {}", e);
-            eprintln!("Is zoxide installed and in your PATH?");
-            exit(1);
-        }
-    };
-
+    let home = env::var_os("HOME").map(PathBuf::from);
     // True when the final directory came from a worktree resolution — used for
     // frecency learning (`zoxide add`) right before we land there.
-    let mut via_worktree = false;
-
-    let resolved_path = if output.status.success() {
-        PathBuf::from(String::from_utf8_lossy(&output.stdout).trim())
-    } else if branch.is_none() && !list_worktrees_mode && !query.is_empty() {
-        // Zoxide knows nothing for this query. Before giving up, do zoxide-like
-        // discovery over the linked worktrees of every repo zoxide *does* know,
-        // matching branch and dir names — so worktrees are findable even if
-        // they've never been visited.
-        let candidates = collect_worktree_candidates();
-        let names: Vec<&str> = candidates.iter().map(|(n, _)| n.as_str()).collect();
-        match match_names(&names, &query) {
-            NameMatch::Found(i) => {
-                via_worktree = true;
-                eprintln!(
-                    "zz: no zoxide match for '{}'; using worktree '{}' ({})",
-                    query,
-                    candidates[i].0,
-                    candidates[i].1.display()
-                );
-                candidates[i].1.clone()
-            }
-            NameMatch::Ambiguous(idx) => {
-                eprintln!("zz: '{}' matches {} worktrees:", query, idx.len());
-                for i in idx {
-                    eprintln!("     {}\t{}", candidates[i].0, candidates[i].1.display());
-                }
-                eprintln!("     refine the query (or use <repo>@<branch>) to select exactly one.");
-                exit(1);
-            }
-            NameMatch::NotFound => {
-                io::stderr().write_all(&output.stderr).unwrap();
-                exit(output.status.code().unwrap_or(1));
-            }
-        }
-    } else {
-        io::stderr().write_all(&output.stderr).unwrap();
-        exit(output.status.code().unwrap_or(1));
+    let (resolved_path, mut via_worktree) = match path_like_query(&query, home.as_deref()) {
+        Some(path) => (existing_dir_or_exit(path), false),
+        None => resolve_with_zoxide(&query, branch.is_none() && !list_worktrees_mode),
     };
     let target_dir = if use_git_root {
         find_git_root(&resolved_path)
@@ -1021,6 +1056,50 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn path_like_query_keyword_is_not_a_path() {
+        assert_eq!(path_like_query("data", Some(Path::new("/home/u"))), None);
+        assert_eq!(
+            path_like_query("meta/data", Some(Path::new("/home/u"))),
+            None
+        );
+        assert_eq!(path_like_query("", Some(Path::new("/home/u"))), None);
+    }
+
+    #[test]
+    fn path_like_query_absolute_and_relative() {
+        assert_eq!(
+            path_like_query("/src/meta/multiposting", None),
+            Some(PathBuf::from("/src/meta/multiposting"))
+        );
+        assert_eq!(path_like_query("./x", None), Some(PathBuf::from("./x")));
+        assert_eq!(path_like_query("../x", None), Some(PathBuf::from("../x")));
+        assert_eq!(path_like_query(".", None), Some(PathBuf::from(".")));
+        assert_eq!(path_like_query("..", None), Some(PathBuf::from("..")));
+    }
+
+    #[test]
+    fn path_like_query_expands_tilde() {
+        let home = Some(Path::new("/home/u"));
+        assert_eq!(
+            path_like_query("~/src/meta/multiposting", home),
+            Some(PathBuf::from("/home/u/src/meta/multiposting"))
+        );
+        assert_eq!(path_like_query("~", home), Some(PathBuf::from("/home/u")));
+        assert_eq!(path_like_query("~/x", None), None);
+        assert_eq!(path_like_query("~user/x", home), None);
+    }
+
+    #[test]
+    fn path_like_query_with_branch_splits_first() {
+        let (query, branch) = split_query_branch("~/src/meta/multiposting@thu-1-fix");
+        assert_eq!(branch.as_deref(), Some("thu-1-fix"));
+        assert_eq!(
+            path_like_query(&query, Some(Path::new("/home/u"))),
+            Some(PathBuf::from("/home/u/src/meta/multiposting"))
+        );
+    }
 
     #[test]
     fn split_query_branch_without_at() {

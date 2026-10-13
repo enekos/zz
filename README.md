@@ -80,6 +80,8 @@ zz [-r|--root] [-w|--worktree <branch>] [-c|--create] [-t|--track] [-p|--print] 
 ```
 
 - `<query>` is passed straight to `zoxide query` to resolve the best-matching directory.
+- A `<query>` written as a path (`/abs`, `~/x`, `./x`, `../x`, `.`, `..`) is used literally and never sent to zoxide, so `zz -c -p ~/src/repo@fix-foo` works for a repo zoxide has never seen. A path that is not a directory is an error.
+- `-p` prints only the path on stdout, even on the call that creates a worktree (git's progress goes to stderr), and exits non-zero with nothing on stdout when nothing resolves. In a script, check the exit status before using the result: `p=$(zz -c -p …) || exit 1`.
 - **Worktree discovery fallback** — when the plain query matches nothing in zoxide, `zz` scans the linked worktrees of every repo zoxide knows and matches branch and worktree-dir names (exact → unique prefix → unique substring). So `zz fix-foo` finds the `fix-foo` worktree even if you've never visited it. Ambiguous fragments list the candidates and exit non-zero instead of guessing.
 - **Frecency learning** — worktrees `zz` lands in are taught back to zoxide (`zoxide add`), so they climb the rankings and plain `z`/`zoxide query` learn them over time.
 - `[command...]` is the command and its arguments to run in that directory.
