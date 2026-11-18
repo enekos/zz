@@ -384,12 +384,82 @@ fn git_branch_exists(repo_root: &Path, branch: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Does the ref `refname` (fully qualified, e.g. `refs/remotes/origin/main`) exist?
+fn git_ref_exists(repo_root: &Path, refname: &str) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["rev-parse", "--verify", "--quiet", refname])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Branch name from `git symbolic-ref --short refs/remotes/<remote>/HEAD`
+/// output (`origin/main` → `main`).
+fn parse_remote_head(text: &str, remote: &str) -> Option<String> {
+    let branch = text.trim().strip_prefix(remote)?.strip_prefix('/')?;
+    (!branch.is_empty()).then(|| branch.to_string())
+}
+
+/// The default branch `origin` advertises: `origin/HEAD` if recorded, else the
+/// first of `main`/`master` that exists as a remote-tracking branch.
+fn origin_default_branch(repo_root: &Path) -> Option<String> {
+    let head = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args([
+            "symbolic-ref",
+            "--quiet",
+            "--short",
+            "refs/remotes/origin/HEAD",
+        ])
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| parse_remote_head(&String::from_utf8_lossy(&out.stdout), "origin"));
+    head.or_else(|| {
+        ["main", "master"]
+            .into_iter()
+            .find(|b| git_ref_exists(repo_root, &format!("refs/remotes/origin/{}", b)))
+            .map(str::to_string)
+    })
+}
+
+/// `git fetch origin <branch>`, non-interactively. True on success.
+fn fetch_origin_branch(repo_root: &Path, branch: &str) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["fetch", "--quiet", "origin", "--", branch])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdout(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 /// Base ref a brand-new branch is cut from: `$ZZ_WORKTREE_BASE` if set, else
-/// the first of `main`/`master` that exists, else the repo's current `HEAD`.
+/// `origin/<default>` freshly fetched (a local `main`/`master` can be days
+/// behind), else the first local `main`/`master`, else the repo's current `HEAD`.
 fn default_base_branch(repo_root: &Path) -> String {
     if let Ok(base) = env::var("ZZ_WORKTREE_BASE") {
         if !base.is_empty() {
             return base;
+        }
+    }
+    if let Some(default) = origin_default_branch(repo_root) {
+        if !fetch_origin_branch(repo_root, &default) {
+            eprintln!(
+                "zz: could not fetch origin/{}; cutting from the last fetched copy",
+                default
+            );
+        }
+        if git_ref_exists(repo_root, &format!("refs/remotes/origin/{}", default)) {
+            return format!("origin/{}", default);
         }
     }
     for candidate in ["main", "master"] {
@@ -440,7 +510,11 @@ fn try_create_worktree(repo_root: &Path, branch: &str) -> Option<PathBuf> {
             branch,
             base
         );
-        cmd.arg("-b").arg(branch).arg(&wt_path).arg(&base);
+        // --no-track: a branch cut from origin/<default> must not adopt it as upstream.
+        cmd.args(["--no-track", "-b"])
+            .arg(branch)
+            .arg(&wt_path)
+            .arg(&base);
     }
 
     match cmd.status() {
@@ -1021,6 +1095,26 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_remote_head_strips_remote() {
+        assert_eq!(
+            parse_remote_head("origin/master\n", "origin"),
+            Some("master".to_string())
+        );
+        assert_eq!(
+            parse_remote_head("origin/feat/x", "origin"),
+            Some("feat/x".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_remote_head_rejects_other_or_empty() {
+        assert_eq!(parse_remote_head("upstream/main", "origin"), None);
+        assert_eq!(parse_remote_head("origin/", "origin"), None);
+        assert_eq!(parse_remote_head("originx/main", "origin"), None);
+        assert_eq!(parse_remote_head("", "origin"), None);
+    }
 
     #[test]
     fn split_query_branch_without_at() {
